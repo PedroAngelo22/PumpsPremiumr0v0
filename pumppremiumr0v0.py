@@ -4,9 +4,7 @@ import math
 import time
 import numpy as np
 from scipy.optimize import root
-import graphviz
 import matplotlib.pyplot as plt
-import io
 
 # Configura o Matplotlib
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -25,7 +23,7 @@ K_FACTORS = {
 }
 FLUIDOS = { "Água a 20°C": {"rho": 998.2, "nu": 1.004e-6}, "Etanol a 20°C": {"rho": 789.0, "nu": 1.51e-6} }
 
-# --- Funções de Callback (sem alterações) ---
+# --- Funções de Callback ---
 def adicionar_item(tipo_lista):
     novo_id = time.time()
     st.session_state[tipo_lista].append({"id": novo_id, "comprimento": 10.0, "diametro": 100.0, "material": "Aço Carbono (novo)", "acessorios": []})
@@ -33,7 +31,23 @@ def adicionar_item(tipo_lista):
 def remover_ultimo_item(tipo_lista):
     if len(st.session_state[tipo_lista]) > 0: st.session_state[tipo_lista].pop()
 
-# --- Funções de Cálculo (com novas adições) ---
+def adicionar_ramal_paralelo():
+    novo_nome_ramal = f"Ramal {len(st.session_state.ramais_paralelos) + 1}"
+    novo_id = time.time()
+    st.session_state.ramais_paralelos[novo_nome_ramal] = [{"id": novo_id, "comprimento": 50.0, "diametro": 80.0, "material": "Aço Carbono (novo)", "acessorios": []}]
+
+def remover_ultimo_ramal():
+    if len(st.session_state.ramais_paralelos) > 1: st.session_state.ramais_paralelos.popitem()
+
+def adicionar_acessorio(id_trecho, lista_trechos):
+    nome_acessorio = st.session_state[f"selectbox_acessorio_{id_trecho}"]
+    quantidade = st.session_state[f"quantidade_acessorio_{id_trecho}"]
+    for trecho in lista_trechos:
+        if trecho["id"] == id_trecho:
+            trecho["acessorios"].append({"nome": nome_acessorio, "k": K_FACTORS[nome_acessorio], "quantidade": int(quantidade)})
+            break
+
+# --- Funções de Cálculo ---
 def calcular_perda_serie(lista_trechos, vazao_m3h, fluido_selecionado):
     perda_total = 0
     for trecho in lista_trechos:
@@ -61,6 +75,25 @@ def calcular_perdas_trecho(trecho, vazao_m3h, fluido_selecionado):
     perda_localizada = k_total_trecho * (velocidade**2 / (2 * 9.81))
     return {"principal": perda_principal, "localizada": perda_localizada, "velocidade": velocidade}
 
+def calcular_perdas_paralelo(ramais, vazao_total_m3h, fluido_selecionado):
+    num_ramais = len(ramais)
+    if num_ramais < 2: return 0, {}
+    lista_ramais = list(ramais.values())
+    def equacoes_perda(vazoes_parciais_m3h):
+        vazao_ultimo_ramal = vazao_total_m3h - sum(vazoes_parciais_m3h)
+        if vazao_ultimo_ramal < -0.01: return [1e12] * (num_ramais - 1)
+        todas_vazoes = np.append(vazoes_parciais_m3h, vazao_ultimo_ramal)
+        perdas = [calcular_perda_serie(ramal, vazao, fluido_selecionado) for ramal, vazao in zip(lista_ramais, todas_vazoes)]
+        erros = [perdas[i] - perdas[-1] for i in range(num_ramais - 1)]
+        return erros
+    chute_inicial = np.full(num_ramais - 1, vazao_total_m3h / num_ramais)
+    solucao = root(equacoes_perda, chute_inicial, method='hybr')
+    if not solucao.success: return -1, {}
+    vazoes_finais = np.append(solucao.x, vazao_total_m3h - sum(solucao.x))
+    perda_final_paralelo = calcular_perda_serie(lista_ramais[0], vazoes_finais[0], fluido_selecionado)
+    distribuicao_vazao = {nome_ramal: vazao for nome_ramal, vazao in zip(ramais.keys(), vazoes_finais)}
+    return perda_final_paralelo, distribuicao_vazao
+
 def calcular_analise_energetica(vazao_m3h, h_man, eficiencia_bomba_percent, eficiencia_motor_percent, horas_dia, custo_kwh, fluido_selecionado):
     rho = FLUIDOS[fluido_selecionado]["rho"]
     ef_bomba = eficiencia_bomba_percent / 100
@@ -69,52 +102,33 @@ def calcular_analise_energetica(vazao_m3h, h_man, eficiencia_bomba_percent, efic
     custo_anual = potencia_eletrica_kW * horas_dia * 30 * 12 * custo_kwh
     return {"potencia_eletrica_kW": potencia_eletrica_kW, "custo_anual": custo_anual}
 
-# --- NOVAS FUNÇÕES PARA CURVA DA BOMBA ---
 def criar_funcao_curva(df_curva, col_x, col_y, grau=2):
-    """Cria uma função polinomial a partir de pontos de uma curva."""
-    # Garante que os dados sejam numéricos e remove linhas com NaN
     df_curva[col_x] = pd.to_numeric(df_curva[col_x], errors='coerce')
     df_curva[col_y] = pd.to_numeric(df_curva[col_y], errors='coerce')
     df_curva = df_curva.dropna(subset=[col_x, col_y])
-    if len(df_curva) < grau + 1:
-        return None # Não há pontos suficientes para o ajuste
-    
+    if len(df_curva) < grau + 1: return None
     coeficientes = np.polyfit(df_curva[col_x], df_curva[col_y], grau)
-    polinomio = np.poly1d(coeficientes)
-    return polinomio
+    return np.poly1d(coeficientes)
 
 def encontrar_ponto_operacao(sistema, h_geometrica, fluido, func_curva_bomba):
-    """Encontra a interseção entre a curva da bomba e a curva do sistema."""
-    
     def curva_sistema(vazao_m3h):
-        """Calcula a altura manométrica total do sistema para uma dada vazão."""
         perda_total = 0
-        # Perdas em série antes
         perda_total += calcular_perda_serie(sistema['antes'], vazao_m3h, fluido)
-        # Perdas em paralelo
         perda_par, _ = calcular_perdas_paralelo(sistema['paralelo'], vazao_m3h, fluido)
-        if perda_par == -1: return 1e12 # Erro no cálculo
+        if perda_par == -1: return 1e12
         perda_total += perda_par
-        # Perdas em série depois
         perda_total += calcular_perda_serie(sistema['depois'], vazao_m3h, fluido)
-        
         return h_geometrica + perda_total
-
-    # Equação a ser resolvida: H_bomba(Q) - H_sistema(Q) = 0
     def erro(vazao_m3h):
         if vazao_m3h < 0: return 1e12
         return func_curva_bomba(vazao_m3h) - curva_sistema(vazao_m3h)
-
-    # Chute inicial para o solver (ex: 50 m³/h)
     solucao = root(erro, 50.0)
-    
     if solucao.success:
         vazao_op = solucao.x[0]
         altura_op = func_curva_bomba(vazao_op)
         return vazao_op, altura_op, curva_sistema
     else:
         return None, None, curva_sistema
-
 
 # --- Inicialização do Estado da Sessão ---
 if 'trechos_antes' not in st.session_state: st.session_state.trechos_antes = []
@@ -124,108 +138,84 @@ if 'ramais_paralelos' not in st.session_state:
         "Ramal 1": [{"id": time.time(), "comprimento": 50.0, "diametro": 80.0, "material": "Aço Carbono (novo)", "acessorios": []}],
         "Ramal 2": [{"id": time.time() + 1, "comprimento": 50.0, "diametro": 100.0, "material": "Aço Carbono (novo)", "acessorios": []}]
     }
+if 'curva_altura_df' not in st.session_state:
+    st.session_state.curva_altura_df = pd.DataFrame([{"Vazão (m³/h)": 0, "Altura (m)": 40}, {"Vazão (m³/h)": 50, "Altura (m)": 35}, {"Vazão (m³/h)": 100, "Altura (m)": 25}])
+if 'curva_eficiencia_df' not in st.session_state:
+    st.session_state.curva_eficiencia_df = pd.DataFrame([{"Vazão (m³/h)": 0, "Eficiência (%)": 0}, {"Vazão (m³/h)": 50, "Eficiência (%)": 70}, {"Vazão (m³/h)": 100, "Eficiência (%)": 65}])
 
 # --- Interface do Aplicativo ---
 st.set_page_config(layout="wide", page_title="Análise de Redes Hidráulicas")
-st.title("💧 Análise de Redes de Bombeamento (Série e Paralelo)")
+st.title("💧 Análise de Redes de Bombeamento com Curva de Bomba")
 
-# --- Barra Lateral ---
+def render_trecho_ui(trecho, prefixo, lista_trechos):
+    st.markdown(f"**Trecho**"); c1, c2, c3 = st.columns(3)
+    trecho['comprimento'] = c1.number_input("L (m)", min_value=0.1, value=trecho['comprimento'], key=f"comp_{prefixo}_{trecho['id']}")
+    trecho['diametro'] = c2.number_input("Ø (mm)", min_value=1.0, value=trecho['diametro'], key=f"diam_{prefixo}_{trecho['id']}")
+    trecho['material'] = c3.selectbox("Material", options=list(MATERIAIS.keys()), index=list(MATERIAIS.keys()).index(trecho.get('material', 'Aço Carbono (novo)')), key=f"mat_{prefixo}_{trecho['id']}")
+    st.markdown("**Acessórios (Fittings)**")
+    for idx, acessorio in enumerate(trecho['acessorios']): 
+        col1, col2 = st.columns([0.8, 0.2])
+        col1.info(f"{acessorio['quantidade']}x {acessorio['nome']} (K = {acessorio['k']})")
+        if col2.button("X", key=f"rem_acc_{trecho['id']}_{idx}", help="Remover acessório"):
+            trecho['acessorios'].pop(idx); st.rerun()
+    c1, c2 = st.columns([3, 1]); c1.selectbox("Selecionar Acessório", options=list(K_FACTORS.keys()), key=f"selectbox_acessorio_{trecho['id']}"); c2.number_input("Qtd", min_value=1, value=1, step=1, key=f"quantidade_acessorio_{trecho['id']}")
+    st.button("Adicionar Acessório", on_click=adicionar_acessorio, args=(trecho['id'], lista_trechos), key=f"btn_add_acessorio_{trecho['id']}", use_container_width=True)
+
 with st.sidebar:
-    st.header("⚙️ Parâmetros Gerais")
-    fluido_selecionado = st.selectbox("Selecione o Fluido", list(FLUIDOS.keys()))
-    h_geometrica = st.number_input("Altura Geométrica (m)", 0.0, value=15.0)
-    
-    st.divider()
-
-    # --- NOVA SEÇÃO: CURVA DA BOMBA ---
+    st.header("⚙️ Parâmetros Gerais"); fluido_selecionado = st.selectbox("Selecione o Fluido", list(FLUIDOS.keys())); h_geometrica = st.number_input("Altura Geométrica (m)", 0.0, value=15.0); st.divider()
     with st.expander("📈 Curva da Bomba", expanded=True):
-        st.info("Insira pelo menos 3 pontos da curva de performance da bomba.")
-        
-        # Tabela para Curva de Altura (Vazão vs. Altura)
-        st.subheader("Curva de Altura Manométrica")
-        if 'curva_altura_df' not in st.session_state:
-            st.session_state.curva_altura_df = pd.DataFrame([
-                {"Vazão (m³/h)": 0, "Altura (m)": 40},
-                {"Vazão (m³/h)": 50, "Altura (m)": 35},
-                {"Vazão (m³/h)": 100, "Altura (m)": 25},
-            ])
-        st.session_state.curva_altura_df = st.data_editor(st.session_state.curva_altura_df, num_rows="dynamic", key="editor_altura")
-
-        # Tabela para Curva de Eficiência (Vazão vs. Eficiência)
-        st.subheader("Curva de Eficiência")
-        if 'curva_eficiencia_df' not in st.session_state:
-            st.session_state.curva_eficiencia_df = pd.DataFrame([
-                {"Vazão (m³/h)": 0, "Eficiência (%)": 0},
-                {"Vazão (m³/h)": 50, "Eficiência (%)": 70},
-                {"Vazão (m³/h)": 100, "Eficiência (%)": 65},
-            ])
-        st.session_state.curva_eficiencia_df = st.data_editor(st.session_state.curva_eficiencia_df, num_rows="dynamic", key="editor_eficiencia")
-
-    st.divider()
-    st.header("🔧 Rede de Tubulação")
-    # (As seções de trechos em série e paralelo continuam aqui, sem alterações)
-    # ...
-
-    st.divider()
-    st.header("🔌 Equipamentos e Custo")
-    rend_motor = st.slider("Eficiência do Motor (%)", 1, 100, 90)
-    horas_por_dia = st.number_input("Horas por Dia", 1.0, 24.0, 8.0, 0.5)
-    tarifa_energia = st.number_input("Custo da Energia (R$/kWh)", 0.10, 5.00, 0.75, 0.01, format="%.2f")
+        st.info("Insira pelo menos 3 pontos da curva de performance.")
+        st.subheader("Curva de Altura"); st.session_state.curva_altura_df = st.data_editor(st.session_state.curva_altura_df, num_rows="dynamic", key="editor_altura")
+        st.subheader("Curva de Eficiência"); st.session_state.curva_eficiencia_df = st.data_editor(st.session_state.curva_eficiencia_df, num_rows="dynamic", key="editor_eficiencia")
+    st.divider(); st.header("🔧 Rede de Tubulação")
+    with st.expander("1. Trechos em Série (Antes da Divisão)"):
+        for i, trecho in enumerate(st.session_state.trechos_antes):
+            with st.container(border=True): render_trecho_ui(trecho, f"antes_{i}", st.session_state.trechos_antes)
+        c1, c2 = st.columns(2); c1.button("Adicionar Trecho (Antes)", on_click=adicionar_item, args=("trechos_antes",), use_container_width=True); c2.button("Remover Trecho (Antes)", on_click=remover_ultimo_item, args=("trechos_antes",), use_container_width=True)
+    with st.expander("2. Ramais em Paralelo"):
+        for nome_ramal, trechos_ramal in st.session_state.ramais_paralelos.items():
+            with st.container(border=True):
+                st.subheader(f"{nome_ramal}")
+                for i, trecho in enumerate(trechos_ramal): render_trecho_ui(trecho, f"par_{nome_ramal}_{i}", trechos_ramal)
+        c1, c2 = st.columns(2); c1.button("Adicionar Ramal Paralelo", on_click=adicionar_ramal_paralelo, use_container_width=True); c2.button("Remover Último Ramal", on_click=remover_ultimo_ramal, use_container_width=True, disabled=len(st.session_state.ramais_paralelos) < 2)
+    with st.expander("3. Trechos em Série (Depois da Junção)"):
+        for i, trecho in enumerate(st.session_state.trechos_depois):
+            with st.container(border=True): render_trecho_ui(trecho, f"depois_{i}", st.session_state.trechos_depois)
+        c1, c2 = st.columns(2); c1.button("Adicionar Trecho (Depois)", on_click=adicionar_item, args=("trechos_depois",), use_container_width=True); c2.button("Remover Trecho (Depois)", on_click=remover_ultimo_item, args=("trechos_depois",), use_container_width=True)
+    st.divider(); st.header("🔌 Equipamentos e Custo"); rend_motor = st.slider("Eficiência do Motor (%)", 1, 100, 90); horas_por_dia = st.number_input("Horas por Dia", 1.0, 24.0, 8.0, 0.5); tarifa_energia = st.number_input("Custo da Energia (R$/kWh)", 0.10, 5.00, 0.75, 0.01, format="%.2f")
 
 # --- Lógica Principal e Exibição de Resultados ---
 try:
-    # 1. Criar as funções da curva da bomba a partir dos dados da tabela
     func_curva_bomba = criar_funcao_curva(st.session_state.curva_altura_df, "Vazão (m³/h)", "Altura (m)")
     func_curva_eficiencia = criar_funcao_curva(st.session_state.curva_eficiencia_df, "Vazão (m³/h)", "Eficiência (%)")
-
     if func_curva_bomba is None or func_curva_eficiencia is None:
-        st.error("Por favor, forneça pontos de dados suficientes (pelo menos 3) para as curvas da bomba.")
+        st.warning("Por favor, forneça pontos de dados suficientes (pelo menos 3) para as curvas da bomba na barra lateral.")
         st.stop()
     
-    # 2. Encontrar o Ponto de Operação
     sistema_atual = {'antes': st.session_state.trechos_antes, 'paralelo': st.session_state.ramais_paralelos, 'depois': st.session_state.trechos_depois}
     vazao_op, altura_op, func_curva_sistema = encontrar_ponto_operacao(sistema_atual, h_geometrica, fluido_selecionado, func_curva_bomba)
-
     if vazao_op is None:
-        st.error("Não foi possível encontrar o ponto de operação. Verifique a curva da bomba e os parâmetros da rede. A bomba pode ser incompatível com o sistema.")
-        st.stop()
+        st.error("Não foi possível encontrar o ponto de operação. Verifique se a curva da bomba é compatível com a perda de carga do sistema."); st.stop()
     
-    # 3. Calcular tudo com base no ponto de operação real
     eficiencia_op = func_curva_eficiencia(vazao_op)
     resultados_energia = calcular_analise_energetica(vazao_op, altura_op, eficiencia_op, rend_motor, horas_por_dia, tarifa_energia, fluido_selecionado)
     perda_total_sistema = altura_op - h_geometrica
 
-    # --- Exibição de Resultados ---
-    st.header("📊 Resultados da Análise no Ponto de Operação")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Vazão de Operação", f"{vazao_op:.2f} m³/h")
-    c2.metric("Altura Manométrica de Operação", f"{altura_op:.2f} m")
-    c3.metric("Eficiência da Bomba no Ponto", f"{eficiencia_op:.1f} %")
-    c4.metric("Custo Anual de Energia", f"R$ {resultados_energia['custo_anual']:.2f}")
+    st.header("📊 Resultados no Ponto de Operação")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Vazão de Operação", f"{vazao_op:.2f} m³/h"); c2.metric("Altura de Operação", f"{altura_op:.2f} m"); c3.metric("Eficiência da Bomba", f"{eficiencia_op:.1f} %"); c4.metric("Custo Anual", f"R$ {resultados_energia['custo_anual']:.2f}")
 
-    # --- Gráfico da Curva da Bomba vs. Sistema ---
     st.header("📈 Gráfico de Curvas: Bomba vs. Sistema")
     max_vazao_curva = st.session_state.curva_altura_df['Vazão (m³/h)'].max()
     vazao_range = np.linspace(0, max_vazao_curva * 1.2, 100)
-    
     altura_bomba = func_curva_bomba(vazao_range)
     altura_sistema = [func_curva_sistema(q) for q in vazao_range]
     
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(vazao_range, altura_bomba, label='Curva da Bomba', color='royalblue', lw=2)
-    ax.plot(vazao_range, altura_sistema, label='Curva do Sistema', color='seagreen', lw=2)
+    fig, ax = plt.subplots(figsize=(10, 6)); ax.plot(vazao_range, altura_bomba, label='Curva da Bomba', color='royalblue', lw=2); ax.plot(vazao_range, altura_sistema, label='Curva do Sistema', color='seagreen', lw=2)
     ax.scatter(vazao_op, altura_op, color='red', s=100, zorder=5, label=f'Ponto de Operação ({vazao_op:.1f} m³/h, {altura_op:.1f} m)')
-    
-    ax.set_xlabel("Vazão (m³/h)")
-    ax.set_ylabel("Altura Manométrica (m)")
-    ax.set_title("Curva da Bomba vs. Curva do Sistema")
-    ax.legend()
-    ax.grid(True)
-    ax.set_xlim(0, vazao_range.max())
-    ax.set_ylim(0, max(altura_bomba.max(), altura_sistema[-1]) * 1.1)
-    
+    ax.set_xlabel("Vazão (m³/h)"); ax.set_ylabel("Altura Manométrica (m)"); ax.set_title("Curva da Bomba vs. Curva do Sistema"); ax.legend(); ax.grid(True)
+    ax.set_xlim(0, vazao_range.max()); ax.set_ylim(0, max(altura_bomba.max(), altura_sistema[-1]) * 1.1 if altura_sistema else altura_bomba.max() * 1.1)
     st.pyplot(fig)
-    
-except Exception as e:
-    st.error(f"Ocorreu um erro durante o cálculo. Verifique os parâmetros de entrada. Detalhe: {str(e)}")
 
+except Exception as e:
+    st.error(f"Ocorreu um erro durante o cálculo. Verifique os parâmetros. Detalhe: {str(e)}")
